@@ -1,84 +1,58 @@
 /*
- * ============================================================
- * PROJECT LAKSHMI — BENCH TEST
- * ============================================================
- * Open in Arduino IDE. Select:
- *   Board:  Arduino Nano
- *   Processor: ATmega328P (Old Bootloader)  ← try this first
- *   Port:   your COM port
- *
- * If upload fails, switch Processor to "ATmega328P" (no "Old")
- *
- * Then open Serial Monitor at 115200 baud and type commands.
- *
- * WIRING:
- *   D9:  Solenoid MOSFET gate
- *   D10: LoRa CS    D11: MOSI    D12: MISO    D13: SCK
- *   D8:  LoRa RST   D2:  LoRa DIO0
- *   A2:  Deployment servo (rack & pinion)
- *
- * COMMANDS (type in Serial Monitor, press Enter):
- *   s = Fire solenoid (2 second pulse)
- *   d = Deploy servo to 180 (rack extends)
- *   r = Retract servo to 0 (rack retracts)
- *   t = Send test LoRa packet
- *   f = Full sequence: solenoid -> pause -> deploy
- *   h = Help
- * ============================================================
+ * PROJECT LAKSHMI — ROVER (LoRa commands ONLY, no serial input)
+ * 
+ * Pins: D6=Solenoid, D3=Servo, D10=LoRa CS, D8=LoRa RST, D7=LoRa DIO0
+ * All commands come from LoRa ground station only.
+ * Serial Monitor is debug output only.
  */
 
 #include <LoRa.h>
 #include <SPI.h>
 #include <Servo.h>
 
-// ---- PINS (match your wiring diagram) ----
-#define PIN_SOLENOID 9
+// ---- PINS ----
+#define PIN_SOLENOID 6
+#define PIN_DEPLOY_SERVO 3
 #define PIN_LORA_CS 10
 #define PIN_LORA_RST 8
-#define PIN_LORA_DIO0 2
-#define PIN_DEPLOY_SERVO A2
+#define PIN_LORA_DIO0 7
 
 // ---- SETTINGS ----
 #define SERVO_STOWED 0
 #define SERVO_DEPLOYED 180
-#define SOL_PULSE_MS 2000
+#define SOL_PULSE_MS 5000
+#define LORA_FREQ 433E6
 
 // ---- GLOBALS ----
 Servo deployServo;
+bool servoAttached = false;  // Don't attach until commanded
 bool loraOK = false;
 
-// Solenoid timing
 bool solFiring = false;
 unsigned long solStart = 0;
 
-// Full sequence
 bool seqRunning = false;
 byte seqStep = 0;
 unsigned long seqTimer = 0;
 
-// ============================================================
-// SETUP
+void handleCommand(char cmd);
+void sendLoRaStatus(const char* msg);
+void attachServoSafe();
+
 // ============================================================
 void setup() {
-  Serial.begin(115200);
-  Serial.println(F("================================"));
-  Serial.println(F(" LAKSHMI BENCH TEST"));
-  Serial.println(F("================================"));
+  Serial.begin(9600);
+  Serial.println(F("--- LAKSHMI ROVER (LoRa only) ---"));
 
-  // Solenoid
   pinMode(PIN_SOLENOID, OUTPUT);
   digitalWrite(PIN_SOLENOID, LOW);
-  Serial.println(F("[OK] Solenoid D9"));
 
-  // Servo
-  deployServo.attach(PIN_DEPLOY_SERVO);
-  deployServo.write(SERVO_STOWED);
-  Serial.println(F("[OK] Servo A2"));
+  // Do NOT attach servo on boot — prevents auto-movement
+  pinMode(PIN_DEPLOY_SERVO, OUTPUT);
+  digitalWrite(PIN_DEPLOY_SERVO, LOW);
 
-  // LoRa
   LoRa.setPins(PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_DIO0);
-  if (LoRa.begin(433E6)) {
-    LoRa.setTxPower(17);
+  if (LoRa.begin((long)LORA_FREQ)) {
     LoRa.setSyncWord(0x34);
     loraOK = true;
     Serial.println(F("[OK] LoRa 433MHz"));
@@ -86,37 +60,33 @@ void setup() {
     Serial.println(F("[FAIL] LoRa!"));
   }
 
-  Serial.println();
-  Serial.println(
-      F("COMMANDS: s=solenoid d=deploy r=retract t=lora f=full h=help"));
-  Serial.println(F("Type a letter and press Enter."));
-  Serial.println();
+  Serial.println(F("Waiting for LoRa commands..."));
 }
 
-// ============================================================
-// LOOP
 // ============================================================
 void loop() {
   unsigned long now = millis();
 
-  // Auto-off solenoid after 2s
+  // ---- Auto-off solenoid ----
   if (solFiring && (now - solStart >= SOL_PULSE_MS)) {
     digitalWrite(PIN_SOLENOID, LOW);
     solFiring = false;
-    Serial.println(F("[SOL] OFF"));
+    Serial.println(F("[SOL] Pulse done"));
+    sendLoRaStatus("SOL_OFF");
   }
 
-  // Full sequence state machine
+  // ---- Full sequence ----
   if (seqRunning) {
     switch (seqStep) {
     case 0:
       digitalWrite(PIN_SOLENOID, HIGH);
       Serial.println(F("[SEQ] Solenoid ON"));
+      sendLoRaStatus("SEQ_SOL_ON");
       seqStep = 1;
       seqTimer = now;
       break;
     case 1:
-      if (now - seqTimer >= 2000) {
+      if (now - seqTimer >= SOL_PULSE_MS) {
         digitalWrite(PIN_SOLENOID, LOW);
         Serial.println(F("[SEQ] Solenoid OFF"));
         seqStep = 2;
@@ -125,15 +95,18 @@ void loop() {
       break;
     case 2:
       if (now - seqTimer >= 1000) {
+        attachServoSafe();
         deployServo.write(SERVO_DEPLOYED);
-        Serial.println(F("[SEQ] Deploying servo..."));
+        Serial.println(F("[SEQ] Servo DEPLOYED"));
+        sendLoRaStatus("SEQ_DEPLOYED");
         seqStep = 3;
         seqTimer = now;
       }
       break;
     case 3:
-      if (now - seqTimer >= 3000) {
-        Serial.println(F("[SEQ] DONE! Type 'r' to retract."));
+      if (now - seqTimer >= 1000) {
+        Serial.println(F("[SEQ] Complete"));
+        sendLoRaStatus("SEQ_DONE");
         seqRunning = false;
         seqStep = 0;
       }
@@ -141,62 +114,99 @@ void loop() {
     }
   }
 
-  // Read serial commands
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    while (Serial.available())
-      Serial.read(); // flush
-
-    switch (cmd) {
-    case 's':
-    case 'S':
-      Serial.println(F("--- SOLENOID ---"));
-      digitalWrite(PIN_SOLENOID, HIGH);
-      solFiring = true;
-      solStart = millis();
-      Serial.println(F("[SOL] ON (2s pulse)"));
-      break;
-
-    case 'd':
-    case 'D':
-      Serial.println(F("--- DEPLOY ---"));
-      deployServo.write(SERVO_DEPLOYED);
-      Serial.println(F("[SERVO] -> 180"));
-      break;
-
-    case 'r':
-    case 'R':
-      Serial.println(F("--- RETRACT ---"));
-      deployServo.write(SERVO_STOWED);
-      Serial.println(F("[SERVO] -> 0"));
-      break;
-
-    case 't':
-    case 'T':
-      Serial.println(F("--- LoRa TX ---"));
-      if (loraOK) {
-        LoRa.beginPacket();
-        LoRa.print("LAKSHMI TEST");
-        LoRa.endPacket();
-        Serial.println(F("[LoRa] Sent!"));
-      } else {
-        Serial.println(F("[LoRa] Not connected"));
-      }
-      break;
-
-    case 'f':
-    case 'F':
-      Serial.println(F("--- FULL SEQUENCE ---"));
-      Serial.println(F("Sol 2s -> pause 1s -> deploy"));
-      seqRunning = true;
-      seqStep = 0;
-      seqTimer = millis();
-      break;
-
-    case 'h':
-    case 'H':
-      Serial.println(F("s=solenoid d=deploy r=retract t=lora f=full"));
-      break;
+  // ---- LoRa receive ONLY ----
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    char cmd = 0;
+    while (LoRa.available()) {
+      cmd = (char)LoRa.read();
+    }
+    // Only accept valid command characters
+    if (cmd == 's' || cmd == 'S' ||
+        cmd == 'd' || cmd == 'D' ||
+        cmd == 'r' || cmd == 'R' ||
+        cmd == 'o' || cmd == 'O' ||
+        cmd == 'f' || cmd == 'F' ||
+        cmd == '?') {
+      Serial.print(F("[LoRa] cmd='"));
+      Serial.print(cmd);
+      Serial.print(F("' RSSI="));
+      Serial.println(LoRa.packetRssi());
+      handleCommand(cmd);
     }
   }
+}
+
+// ============================================================
+void attachServoSafe() {
+  if (!servoAttached) {
+    deployServo.attach(PIN_DEPLOY_SERVO);
+    servoAttached = true;
+  }
+}
+
+// ============================================================
+void handleCommand(char cmd) {
+  switch (cmd) {
+  case 's':
+  case 'S':
+    Serial.println(F("[CMD] Solenoid"));
+    digitalWrite(PIN_SOLENOID, HIGH);
+    solFiring = true;
+    solStart = millis();
+    sendLoRaStatus("SOL_ON");
+    break;
+
+  case 'd':
+  case 'D':
+    Serial.println(F("[CMD] Deploy"));
+    attachServoSafe();
+    deployServo.write(SERVO_DEPLOYED);
+    sendLoRaStatus("DEPLOYED");
+    break;
+
+  case 'r':
+  case 'R':
+    Serial.println(F("[CMD] Retract"));
+    attachServoSafe();
+    deployServo.write(SERVO_STOWED);
+    sendLoRaStatus("RETRACTED");
+    break;
+
+  case 'o':
+  case 'O':
+    Serial.println(F("[CMD] All OFF"));
+    digitalWrite(PIN_SOLENOID, LOW);
+    solFiring = false;
+    if (servoAttached) {
+      deployServo.write(SERVO_STOWED);
+      deployServo.detach();
+      servoAttached = false;
+    }
+    sendLoRaStatus("ALL_OFF");
+    break;
+
+  case 'f':
+  case 'F':
+    if (!seqRunning) {
+      Serial.println(F("[CMD] Full sequence"));
+      seqRunning = true;
+      seqStep = 0;
+      sendLoRaStatus("SEQ_START");
+    }
+    break;
+
+  case '?':
+    sendLoRaStatus(solFiring ? "STATUS:SOL_ON" : "STATUS:IDLE");
+    break;
+  }
+}
+
+// ============================================================
+void sendLoRaStatus(const char* msg) {
+  if (!loraOK) return;
+  LoRa.beginPacket();
+  LoRa.print("LK:");
+  LoRa.print(msg);
+  LoRa.endPacket(true);
 }
